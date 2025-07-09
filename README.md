@@ -1,4 +1,4 @@
-# Natural Quadrant Zoom Viewer (bad quality copy)
+# Google earth (bad quality copy)
 
 A Python-based image viewer that provides smooth, natural zooming into quadrants of images with animated transitions. Perfect for exploring hierarchical image data, maps, or any content that can be divided into quadrants at different zoom levels.
 
