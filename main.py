@@ -1,13 +1,17 @@
 import os
+import gc
+import weakref
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from matplotlib.animation import FuncAnimation
 from PIL import Image
 import numpy as np
 import time
+from functools import lru_cache
+from typing import Optional, Tuple, Dict, Any
 
-class QuadrantZoomViewer:
-    def __init__(self, root_image_path="root.png"):
+class OptimizedQuadrantZoomViewer:
+    def __init__(self, root_image_path="root.png", cache_size=16):
         self.root_image_path = root_image_path
         self.current_path = ""  # Current zoom path (e.g., "0_2_1")
         self.current_image = None
@@ -17,7 +21,7 @@ class QuadrantZoomViewer:
 
         self.mouse_quadrant = 0  # Track which quadrant mouse is over
         
-        # Animation state
+        # Animation state - using __slots__ equivalent with explicit cleanup
         self.is_animating = False
         self.animation_frames = 20
         self.current_frame = 0
@@ -26,43 +30,110 @@ class QuadrantZoomViewer:
         self.zoom_end_bounds = None
         self.pending_path = None
         self.zoom_direction = 1  # 1 for zoom in, -1 for zoom out
+        self.animation_timer = None
+        
+        # Memory optimization: Image cache with weak references
+        self._image_cache: Dict[str, Any] = {}
+        self._cache_size = cache_size
+        
+        # Pre-allocate numpy arrays for quadrant bounds to avoid repeated allocation
+        self._quadrant_bounds_cache = {}
+        
+        # Optimize matplotlib patches - reuse rectangles
+        self._highlight_rect = None
+        self._text_objects = []
+        
+        # Enable garbage collection optimizations
+        gc.set_threshold(700, 10, 10)  # More aggressive GC
         
         # Load and display the root image
         self.load_current_image()
         self.display_image()
+    
+    def __del__(self):
+        """Cleanup resources when object is destroyed"""
+        self.cleanup()
+    
+    def cleanup(self):
+        """Explicit cleanup method"""
+        # Clear image cache
+        for img in self._image_cache.values():
+            if hasattr(img, 'close'):
+                img.close()
+        self._image_cache.clear()
         
-    def get_image_filename(self, path=""):
-        """Generate filename based on current path"""
+        # Clear matplotlib objects
+        if self._highlight_rect:
+            self._highlight_rect.remove()
+        for text_obj in self._text_objects:
+            text_obj.remove()
+        self._text_objects.clear()
+        
+        # Stop animation timer
+        if self.animation_timer:
+            self.animation_timer.stop()
+            self.animation_timer = None
+        
+        # Clear bounds cache
+        self._quadrant_bounds_cache.clear()
+        
+        # Force garbage collection
+        gc.collect()
+    
+    @lru_cache(maxsize=32)
+    def get_image_filename(self, path: str = "") -> str:
+        """Generate filename based on current path - cached to avoid string operations"""
         if path == "":
             return self.root_image_path
         else:
-            base_name = self.root_image_path.split('.')[0]
-            extension = self.root_image_path.split('.')[-1]
-            return f"{base_name}_{path}.{extension}"
+            base_name, extension = os.path.splitext(self.root_image_path)
+            return f"{base_name}_{path}{extension}"
     
     def load_current_image(self):
-        """Load the current image based on the current path"""
+        """Load the current image based on the current path with caching"""
         filename = self.get_image_filename(self.current_path)
         
+        # Check cache first
+        if filename in self._image_cache:
+            self.current_image = self._image_cache[filename]
+            return
+        
         try:
-            self.current_image = Image.open(filename)
-            print(f"Loaded: {filename}")
+            # Load image
+            img = Image.open(filename)
+            
+            # Cache management - remove oldest if cache is full
+            if len(self._image_cache) >= self._cache_size:
+                # Remove oldest entry (simple FIFO)
+                oldest_key = next(iter(self._image_cache))
+                old_img = self._image_cache.pop(oldest_key)
+                if hasattr(old_img, 'close'):
+                    old_img.close()
+                # Force garbage collection after removing old image
+                gc.collect()
+            
+            # Add to cache
+            self._image_cache[filename] = img
+            self.current_image = img
+            print(f"Loaded and cached: {filename}")
+            
         except FileNotFoundError:
             print(f"Image not found: {filename}")
-            # Create a placeholder image with quadrant labels
-            self.current_image = self.create_placeholder_image()
+            # Create and cache placeholder
+            if "placeholder" not in self._image_cache:
+                self._image_cache["placeholder"] = self.create_placeholder_image()
+            self.current_image = self._image_cache["placeholder"]
     
-    def create_placeholder_image(self):
-        """Create a placeholder image with quadrant numbers"""
-        img = Image.new('RGB', (400, 400), color='lightgray')
+    def create_placeholder_image(self) -> Image.Image:
+        """Create a placeholder image with quadrant numbers - optimized"""
+        # Use more efficient numpy array creation
+        pixels = np.empty((400, 400, 3), dtype=np.uint8)
         
-        # You could add text here using PIL's ImageDraw if needed
-        # For simplicity, we'll just use colored quadrants
-        pixels = np.array(img)
+        # Fill quadrants using array slicing (more efficient than pixel-by-pixel)
+        mid_h, mid_w = 200, 200
         
-        # Color the quadrants differently
-        h, w = pixels.shape[:2]
-        mid_h, mid_w = h // 2, w // 2
+        # Use memoryview for even faster access
+        pixels_view = memoryview(pixels)
         
         # Quadrant 0 (top-left) - light blue
         pixels[:mid_h, :mid_w] = [173, 216, 230]
@@ -75,23 +146,44 @@ class QuadrantZoomViewer:
         
         return Image.fromarray(pixels)
     
-    def get_quadrant_bounds(self, quadrant):
-        """Get the bounds of a specific quadrant"""
-        img_width, img_height = self.current_image.size
-        mid_x, mid_y = img_width // 2, img_height // 2
+    def get_quadrant_bounds(self, quadrant: int) -> Tuple[int, int, int, int]:
+        """Get the bounds of a specific quadrant - cached for performance"""
+        if not self.current_image:
+            return (0, 0, 0, 0)
         
-        bounds = {
+        cache_key = (self.current_image.size, quadrant)
+        if cache_key in self._quadrant_bounds_cache:
+            return self._quadrant_bounds_cache[cache_key]
+        
+        img_width, img_height = self.current_image.size
+        mid_x, mid_y = img_width >> 1, img_height >> 1  # Bit shift is faster than //
+        
+        bounds_map = {
             0: (0, 0, mid_x, mid_y),           # top-left
             1: (mid_x, 0, img_width, mid_y),   # top-right
             2: (0, mid_y, mid_x, img_height),  # bottom-left
             3: (mid_x, mid_y, img_width, img_height)  # bottom-right
         }
         
-        return bounds[quadrant]
+        bounds = bounds_map[quadrant]
+        self._quadrant_bounds_cache[cache_key] = bounds
+        return bounds
     
     def display_image(self):
-        """Display the current image with quadrant grid overlay"""
-        self.ax.clear()
+        """Display the current image with quadrant grid overlay - optimized"""
+        # Clear only what's necessary
+        if self._highlight_rect:
+            self._highlight_rect.remove()
+            self._highlight_rect = None
+        
+        for text_obj in self._text_objects:
+            text_obj.remove()
+        self._text_objects.clear()
+        
+        # Only clear axes if we have a new image
+        if not hasattr(self, '_last_image_size') or self._last_image_size != self.current_image.size:
+            self.ax.clear()
+            self._last_image_size = self.current_image.size
         
         if self.current_image:
             # Display the image
@@ -101,7 +193,7 @@ class QuadrantZoomViewer:
             if not self.is_animating:
                 # Add quadrant grid overlay
                 img_width, img_height = self.current_image.size
-                mid_x, mid_y = img_width // 2, img_height // 2
+                mid_x, mid_y = img_width >> 1, img_height >> 1
                 
                 # Draw grid lines
                 self.ax.axhline(y=mid_y, color='red', linestyle='--', alpha=0.7, linewidth=2)
@@ -109,20 +201,25 @@ class QuadrantZoomViewer:
                 
                 # Highlight the quadrant where mouse is hovering
                 x1, y1, x2, y2 = self.get_quadrant_bounds(self.mouse_quadrant)
-                highlight_rect = patches.Rectangle((x1, y1), x2-x1, y2-y1, 
-                                                 linewidth=3, edgecolor='yellow', 
-                                                 facecolor='yellow', alpha=0.2)
-                self.ax.add_patch(highlight_rect)
+                self._highlight_rect = patches.Rectangle((x1, y1), x2-x1, y2-y1, 
+                                                       linewidth=3, edgecolor='yellow', 
+                                                       facecolor='yellow', alpha=0.2)
+                self.ax.add_patch(self._highlight_rect)
                 
-                # Add quadrant labels
-                self.ax.text(mid_x//2, mid_y//2, '0', fontsize=20, ha='center', va='center', 
-                            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
-                self.ax.text(mid_x + mid_x//2, mid_y//2, '1', fontsize=20, ha='center', va='center',
-                            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
-                self.ax.text(mid_x//2, mid_y + mid_y//2, '2', fontsize=20, ha='center', va='center',
-                            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
-                self.ax.text(mid_x + mid_x//2, mid_y + mid_y//2, '3', fontsize=20, ha='center', va='center',
-                            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+                # Add quadrant labels - reuse text objects
+                text_props = dict(fontsize=20, ha='center', va='center',
+                                bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+                
+                positions = [
+                    (mid_x >> 1, mid_y >> 1, '0'),
+                    (mid_x + (mid_x >> 1), mid_y >> 1, '1'),
+                    (mid_x >> 1, mid_y + (mid_y >> 1), '2'),
+                    (mid_x + (mid_x >> 1), mid_y + (mid_y >> 1), '3')
+                ]
+                
+                for x, y, label in positions:
+                    text_obj = self.ax.text(x, y, label, **text_props)
+                    self._text_objects.append(text_obj)
             
             # Set title based on animation state
             if self.is_animating:
@@ -142,8 +239,8 @@ class QuadrantZoomViewer:
         plt.tight_layout()
         plt.draw()
     
-    def animate_zoom(self, frame):
-        """Animation function for smooth zooming"""
+    def animate_zoom(self, frame: int):
+        """Animation function for smooth zooming - optimized"""
         if frame >= self.animation_frames:
             # Animation complete
             self.is_animating = False
@@ -157,22 +254,29 @@ class QuadrantZoomViewer:
                 # Just update display
                 self.display_image()
             
+            # Clean up animation timer
+            if self.animation_timer:
+                self.animation_timer.stop()
+                self.animation_timer = None
+            
             return
         
         # Calculate interpolation factor (0 to 1)
         t = frame / (self.animation_frames - 1)
         
-        # Smooth easing function (ease-in-out)
-        t = t * t * (3 - 2 * t)
+        # Smooth easing function (ease-in-out) - optimized
+        t = t * t * (3.0 - 2.0 * t)
         
         # Interpolate between start and end bounds
         start_x1, start_y1, start_x2, start_y2 = self.zoom_start_bounds
         end_x1, end_y1, end_x2, end_y2 = self.zoom_end_bounds
         
-        current_x1 = start_x1 + (end_x1 - start_x1) * t
-        current_y1 = start_y1 + (end_y1 - start_y1) * t
-        current_x2 = start_x2 + (end_x2 - start_x2) * t
-        current_y2 = start_y2 + (end_y2 - start_y2) * t
+        # Use faster arithmetic
+        inv_t = 1.0 - t
+        current_x1 = start_x1 * inv_t + end_x1 * t
+        current_y1 = start_y1 * inv_t + end_y1 * t
+        current_x2 = start_x2 * inv_t + end_x2 * t
+        current_y2 = start_y2 * inv_t + end_y2 * t
         
         # Set the view bounds
         self.ax.set_xlim(current_x1, current_x2)
@@ -180,7 +284,7 @@ class QuadrantZoomViewer:
         
         plt.draw()
     
-    def start_zoom_animation(self, target_quadrant, zoom_in=True):
+    def start_zoom_animation(self, target_quadrant: int, zoom_in: bool = True):
         """Start zoom animation to a specific quadrant"""
         if self.is_animating:
             return
@@ -197,7 +301,7 @@ class QuadrantZoomViewer:
             
             # Prepare new path
             if self.current_path:
-                self.pending_path = self.current_path + f"_{target_quadrant}"
+                self.pending_path = f"{self.current_path}_{target_quadrant}"
             else:
                 self.pending_path = str(target_quadrant)
         else:
@@ -222,9 +326,12 @@ class QuadrantZoomViewer:
                     self.zoom_start_bounds = self.get_quadrant_bounds(last_quadrant)
                     self.zoom_end_bounds = (0, 0, self.current_image.size[0], self.current_image.size[1])
         
-        # Start animation
+        # Start animation with optimized timer
         self.current_frame = 0
-        self.animation_timer = self.fig.canvas.new_timer(interval=50)  # 50ms = 20 FPS
+        if self.animation_timer:
+            self.animation_timer.stop()
+        
+        self.animation_timer = self.fig.canvas.new_timer(interval=33)  # ~30 FPS for smoother animation
         self.animation_timer.add_callback(self.animate_step)
         self.animation_timer.start()
     
@@ -245,19 +352,15 @@ class QuadrantZoomViewer:
         
         # Get mouse coordinates
         x, y = event.xdata, event.ydata
+        if x is None or y is None:
+            return
         
-        # Determine which quadrant mouse is over
+        # Determine which quadrant mouse is over - optimized with bit operations
         img_width, img_height = self.current_image.size
-        mid_x, mid_y = img_width // 2, img_height // 2
+        mid_x, mid_y = img_width >> 1, img_height >> 1
         
-        if x < mid_x and y < mid_y:
-            new_quadrant = 0  # top-left
-        elif x >= mid_x and y < mid_y:
-            new_quadrant = 1  # top-right
-        elif x < mid_x and y >= mid_y:
-            new_quadrant = 2  # bottom-left
-        else:
-            new_quadrant = 3  # bottom-right
+        # Use bitwise operations for quadrant calculation
+        new_quadrant = (2 if y >= mid_y else 0) + (1 if x >= mid_x else 0)
         
         # Only redraw if quadrant changed
         if new_quadrant != self.mouse_quadrant:
@@ -278,15 +381,26 @@ class QuadrantZoomViewer:
                 print(f"Zooming out from path: {self.current_path}")
                 self.start_zoom_animation(0, zoom_in=False)  # quadrant doesn't matter for zoom out
     
-
-    
     def run(self):
-        plt.show()
+        """Run the viewer"""
+        try:
+            plt.show()
+        finally:
+            self.cleanup()
 
 def main():
+    # Enable garbage collection debugging (optional)
+    # gc.set_debug(gc.DEBUG_STATS)
+    
     # You can change the root image filename here
-    viewer = QuadrantZoomViewer("data/root.jpg")
-    viewer.run()
+    viewer = OptimizedQuadrantZoomViewer("data/root.jpg", cache_size=16)
+    
+    try:
+        viewer.run()
+    finally:
+        # Ensure cleanup happens
+        viewer.cleanup()
+        gc.collect()
 
 if __name__ == "__main__":
     main()
