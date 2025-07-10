@@ -14,7 +14,7 @@ class QuadrantZoomViewer:
         self.fig, self.ax = plt.subplots(figsize=(10, 10))
         self.fig.canvas.mpl_connect('scroll_event', self.on_scroll)
         self.fig.canvas.mpl_connect('motion_notify_event', self.on_mouse_move)
-        self.fig.canvas.mpl_connect('key_press_event', self.on_key_press)
+
         self.mouse_quadrant = 0  # Track which quadrant mouse is over
         
         # Animation state
@@ -278,30 +278,9 @@ class QuadrantZoomViewer:
                 print(f"Zooming out from path: {self.current_path}")
                 self.start_zoom_animation(0, zoom_in=False)  # quadrant doesn't matter for zoom out
     
-    def on_key_press(self, event):
-        """Handle key press events"""
-        if self.is_animating:
-            return
-            
-        if event.key == 'b':  # Go back
-            if self.current_path:
-                print(f"Going back from path: {self.current_path}")
-                self.start_zoom_animation(0, zoom_in=False)
-        elif event.key == 'q':  # Quit
-            plt.close()
+
     
     def run(self):
-        """Start the viewer"""
-        print("Natural Quadrant Zoom Viewer")
-        print("Instructions:")
-        print("- Move mouse over quadrants to highlight them")
-        print("- Scroll up over a quadrant to zoom in with animation")
-        print("- Scroll down to zoom out with animation")
-        print("- Press 'b' to go back to previous level")
-        print("- Press 'q' to quit")
-        print(f"Looking for images with pattern: {self.root_image_path.split('.')[0]}_[path].{self.root_image_path.split('.')[-1]}")
-        print("Example: root.png, root_0.png, root_0_2.png, root_0_2_1.png")
-        
         plt.show()
 
 def main():
