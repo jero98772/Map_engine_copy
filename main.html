@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Quadrant Zoom Viewer</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            font-family: Arial, sans-serif;
+            background-color: #f0f0f0;
+        }
+        
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        
+        .title {
+            text-align: center;
+            color: #333;
+            margin-bottom: 20px;
+        }
+        
+        .canvas-container {
+            position: relative;
+            width: 600px;
+            height: 600px;
+            margin: 0 auto;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+            cursor: crosshair;
+        }
+        
+        .info {
+            text-align: center;
+            margin-top: 20px;
+            padding: 10px;
+            background-color: #f9f9f9;
+            border-radius: 4px;
+        }
+        
+        .controls {
+            text-align: center;
+            margin-top: 15px;
+        }
+        
+        button {
+            padding: 8px 16px;
+            margin: 0 5px;
+            border: none;
+            border-radius: 4px;
+            background-color: #007bff;
+            color: white;
+            cursor: pointer;
+        }
+        
+        button:hover {
+            background-color: #0056b3;
+        }
+        
+        button:disabled {
+            background-color: #ccc;
+            cursor: not-allowed;
+        }
+        
+        .quadrant-highlight {
+            position: absolute;
+            border: 3px solid yellow;
+            background-color: rgba(255, 255, 0, 0.2);
+            pointer-events: none;
+            transition: all 0.1s ease;
+        }
+        
+        .quadrant-label {
+            position: absolute;
+            background: white;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            padding: 4px 8px;
+            font-weight: bold;
+            font-size: 18px;
+            pointer-events: none;
+            transform: translate(-50%, -50%);
+        }
+        
+        .grid-line {
+            position: absolute;
+            background-color: red;
+            opacity: 0.7;
+        }
+        
+        .grid-line.horizontal {
+            height: 2px;
+            width: 100%;
+            top: 50%;
+            left: 0;
+            transform: translateY(-50%);
+        }
+        
+        .grid-line.vertical {
+            width: 2px;
+            height: 100%;
+            left: 50%;
+            top: 0;
+            transform: translateX(-50%);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1 class="title">Quadrant Zoom Viewer</h1>
+        
+        <div class="canvas-container" id="canvasContainer">
+            <canvas id="canvas" width="600" height="600"></canvas>
+            <div class="grid-line horizontal" id="gridHorizontal"></div>
+            <div class="grid-line vertical" id="gridVertical"></div>
+            <div class="quadrant-highlight" id="quadrantHighlight"></div>
+            <div class="quadrant-label" id="label0">0</div>
+            <div class="quadrant-label" id="label1">1</div>
+            <div class="quadrant-label" id="label2">2</div>
+            <div class="quadrant-label" id="label3">3</div>
+        </div>
+        
+        <div class="info">
+            <div id="pathInfo">Current Path: root</div>
+            <div>Scroll up over a quadrant to zoom in, scroll down to zoom out</div>
+        </div>
+        
+        <div class="controls">
+            <button id="resetBtn">Reset to Root</button>
+            <button id="backBtn">Go Back</button>
+        </div>
+    </div>
+
+    <script>
+        class QuadrantZoomViewer {
+            constructor() {
+                this.canvas = document.getElementById('canvas');
+                this.ctx = this.canvas.getContext('2d');
+                this.canvasContainer = document.getElementById('canvasContainer');
+                
+                this.currentPath = '';
+                this.currentImage = null;
+                this.mouseQuadrant = 0;
+                this.imageCache = new Map();
+                this.cacheSize = 16;
+                
+                // Animation state
+                this.isAnimating = false;
+                this.animationFrames = 20;
+                this.currentFrame = 0;
+                this.zoomDirection = 1;
+                this.animationId = null;
+                
+                // UI elements
+                this.pathInfo = document.getElementById('pathInfo');
+                this.quadrantHighlight = document.getElementById('quadrantHighlight');
+                this.gridHorizontal = document.getElementById('gridHorizontal');
+                this.gridVertical = document.getElementById('gridVertical');
+                this.resetBtn = document.getElementById('resetBtn');
+                this.backBtn = document.getElementById('backBtn');
+                
+                // Bind events
+                this.canvas.addEventListener('wheel', this.onScroll.bind(this));
+                this.canvas.addEventListener('mousemove', this.onMouseMove.bind(this));
+                this.resetBtn.addEventListener('click', this.reset.bind(this));
+                this.backBtn.addEventListener('click', this.goBack.bind(this));
+                
+                // Initialize
+                this.loadCurrentImage();
+            }
+            
+            getImageFilename(path = '') {
+                if (path === '') {
+                    return 'data/root.jpg';
+                }
+                return `data/root_${path}.jpg`;
+            }
+            
+            async loadCurrentImage() {
+                const filename = this.getImageFilename(this.currentPath);
+                
+                // Check cache first
+                if (this.imageCache.has(filename)) {
+                    this.currentImage = this.imageCache.get(filename);
+                    this.displayImage();
+                    return;
+                }
+                
+                try {
+                    const img = new Image();
+                    img.onload = () => {
+                        // Cache management
+                        if (this.imageCache.size >= this.cacheSize) {
+                            const firstKey = this.imageCache.keys().next().value;
+                            this.imageCache.delete(firstKey);
+                        }
+                        
+                        this.imageCache.set(filename, img);
+                        this.currentImage = img;
+                        this.displayImage();
+                        console.log(`Loaded and cached: ${filename}`);
+                    };
+                    
+                    img.onerror = () => {
+                        console.log(`Image not found: ${filename}`);
+                        // Create placeholder
+                        this.currentImage = this.createPlaceholderImage();
+                        this.displayImage();
+                    };
+                    
+                    img.src = filename;
+                } catch (error) {
+                    console.error('Error loading image:', error);
+                    this.currentImage = this.createPlaceholderImage();
+                    this.displayImage();
+                }
+            }
+            
+            createPlaceholderImage() {
+                const canvas = document.createElement('canvas');
+                canvas.width = 400;
+                canvas.height = 400;
+                const ctx = canvas.getContext('2d');
+                
+                const mid = 200;
+                
+                // Quadrant 0 (top-left) - light blue
+                ctx.fillStyle = '#ADD8E6';
+                ctx.fillRect(0, 0, mid, mid);
+                
+                // Quadrant 1 (top-right) - light green
+                ctx.fillStyle = '#90EE90';
+                ctx.fillRect(mid, 0, mid, mid);
+                
+                // Quadrant 2 (bottom-left) - light coral
+                ctx.fillStyle = '#F08080';
+                ctx.fillRect(0, mid, mid, mid);
+                
+                // Quadrant 3 (bottom-right) - light yellow
+                ctx.fillStyle = '#FFFFE0';
+                ctx.fillRect(mid, mid, mid, mid);
+                
+                // Convert canvas to image
+                const img = new Image();
+                img.src = canvas.toDataURL();
+                return img;
+            }
+            
+            getQuadrantBounds(quadrant) {
+                if (!this.currentImage) return [0, 0, 0, 0];
+                
+                const width = this.currentImage.width || this.currentImage.naturalWidth;
+                const height = this.currentImage.height || this.currentImage.naturalHeight;
+                const midX = Math.floor(width / 2);
+                const midY = Math.floor(height / 2);
+                
+                const boundsMap = {
+                    0: [0, 0, midX, midY],           // top-left
+                    1: [midX, 0, width, midY],       // top-right
+                    2: [0, midY, midX, height],      // bottom-left
+                    3: [midX, midY, width, height]   // bottom-right
+                };
+                
+                return boundsMap[quadrant];
+            }
+            
+            displayImage() {
+                if (!this.currentImage) return;
+                
+                // Clear canvas
+                this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+                
+                // Draw image
+                this.ctx.drawImage(this.currentImage, 0, 0, this.canvas.width, this.canvas.height);
+                
+                // Update UI
+                this.updateUI();
+            }
+            
+            updateUI() {
+                const isAnimating = this.isAnimating;
+                
+                // Update path info
+                const pathText = this.currentPath || 'root';
+                this.pathInfo.textContent = isAnimating ? 
+                    (this.zoomDirection === 1 ? 'Zooming in...' : 'Zooming out...') :
+                    `Current Path: ${pathText}`;
+                
+                // Show/hide grid and highlights
+                this.gridHorizontal.style.display = isAnimating ? 'none' : 'block';
+                this.gridVertical.style.display = isAnimating ? 'none' : 'block';
+                this.quadrantHighlight.style.display = isAnimating ? 'none' : 'block';
+                
+                // Update quadrant labels
+                for (let i = 0; i < 4; i++) {
+                    const label = document.getElementById(`label${i}`);
+                    if (label) {
+                        label.style.display = isAnimating ? 'none' : 'block';
+                        this.positionQuadrantLabel(label, i);
+                    }
+                }
+                
+                // Update quadrant highlight
+                if (!isAnimating) {
+                    this.updateQuadrantHighlight();
+                }
+                
+                // Update buttons
+                this.backBtn.disabled = !this.currentPath;
+            }
+            
+            positionQuadrantLabel(label, quadrant) {
+                const bounds = this.getQuadrantBounds(quadrant);
+                const canvasRect = this.canvas.getBoundingClientRect();
+                const containerRect = this.canvasContainer.getBoundingClientRect();
+                
+                const scaleX = this.canvas.width / canvasRect.width;
+                const scaleY = this.canvas.height / canvasRect.height;
+                
+                const centerX = ((bounds[0] + bounds[2]) / 2) / scaleX;
+                const centerY = ((bounds[1] + bounds[3]) / 2) / scaleY;
+                
+                label.style.left = centerX + 'px';
+                label.style.top = centerY + 'px';
+            }
+            
+            updateQuadrantHighlight() {
+                const bounds = this.getQuadrantBounds(this.mouseQuadrant);
+                const canvasRect = this.canvas.getBoundingClientRect();
+                const containerRect = this.canvasContainer.getBoundingClientRect();
+                
+                const scaleX = this.canvas.width / canvasRect.width;
+                const scaleY = this.canvas.height / canvasRect.height;
+                
+                const x = bounds[0] / scaleX;
+                const y = bounds[1] / scaleY;
+                const width = (bounds[2] - bounds[0]) / scaleX;
+                const height = (bounds[3] - bounds[1]) / scaleY;
+                
+                this.quadrantHighlight.style.left = x + 'px';
+                this.quadrantHighlight.style.top = y + 'px';
+                this.quadrantHighlight.style.width = width + 'px';
+                this.quadrantHighlight.style.height = height + 'px';
+            }
+            
+            onMouseMove(event) {
+                if (this.isAnimating) return;
+                
+                const rect = this.canvas.getBoundingClientRect();
+                const x = (event.clientX - rect.left) / rect.width;
+                const y = (event.clientY - rect.top) / rect.height;
+                
+                // Determine quadrant
+                const newQuadrant = (y >= 0.5 ? 2 : 0) + (x >= 0.5 ? 1 : 0);
+                
+                if (newQuadrant !== this.mouseQuadrant) {
+                    this.mouseQuadrant = newQuadrant;
+                    this.updateQuadrantHighlight();
+                }
+            }
+            
+            onScroll(event) {
+                if (this.isAnimating) return;
+                
+                event.preventDefault();
+                
+                if (event.deltaY < 0) { // Scroll up - zoom in
+                    console.log(`Zooming into quadrant ${this.mouseQuadrant}`);
+                    this.startZoomAnimation(this.mouseQuadrant, true);
+                } else if (event.deltaY > 0) { // Scroll down - zoom out
+                    if (this.currentPath) {
+                        console.log(`Zooming out from path: ${this.currentPath}`);
+                        this.startZoomAnimation(0, false);
+                    }
+                }
+            }
+            
+            startZoomAnimation(targetQuadrant, zoomIn) {
+                if (this.isAnimating) return;
+                
+                this.isAnimating = true;
+                this.zoomDirection = zoomIn ? 1 : -1;
+                this.currentFrame = 0;
+                
+                if (zoomIn) {
+                    // Prepare new path
+                    this.pendingPath = this.currentPath ? 
+                        `${this.currentPath}_${targetQuadrant}` : 
+                        targetQuadrant.toString();
+                } else {
+                    // Update current path
+                    if (this.currentPath) {
+                        const pathParts = this.currentPath.split('_');
+                        if (pathParts.length > 1) {
+                            this.currentPath = pathParts.slice(0, -1).join('_');
+                        } else {
+                            this.currentPath = '';
+                        }
+                        this.loadCurrentImage();
+                    }
+                }
+                
+                this.animateZoom();
+            }
+            
+            animateZoom() {
+                if (this.currentFrame >= this.animationFrames) {
+                    // Animation complete
+                    this.isAnimating = false;
+                    
+                    if (this.zoomDirection === 1) {
+                        // Zoom in complete
+                        this.currentPath = this.pendingPath;
+                        this.loadCurrentImage();
+                    } else {
+                        // Zoom out complete
+                        this.displayImage();
+                    }
+                    
+                    return;
+                }
+                
+                // Update UI during animation
+                this.updateUI();
+                
+                this.currentFrame++;
+                this.animationId = requestAnimationFrame(() => this.animateZoom());
+            }
+            
+            reset() {
+                if (this.isAnimating) return;
+                
+                this.currentPath = '';
+                this.loadCurrentImage();
+            }
+            
+            goBack() {
+                if (this.isAnimating || !this.currentPath) return;
+                
+                this.startZoomAnimation(0, false);
+            }
+        }
+        
+        // Initialize the viewer when the page loads
+        window.addEventListener('load', () => {
+            new QuadrantZoomViewer();
+        });
+    </script>
+</body>
+</html>
